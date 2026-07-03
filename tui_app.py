@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stt-sidecar: локальный VOSK STT сервер + Rich TUI.
 
-Первый запуск автоматически скачивает модель (~1.8GB).
+При первом запуске спрашивает small (40MB) или big (1.8GB) модель.
 Подбирает свободный порт начиная с 8081.
 После запуска: ws://localhost:PORT/ws/transcribe + http://localhost:PORT/health
 Выход: Ctrl+C
@@ -12,6 +12,8 @@ from pathlib import Path
 from urllib.request import urlretrieve
 
 from fastapi import FastAPI, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
@@ -23,12 +25,24 @@ import uvicorn
 # ── config ──────────────────────────────────────────────────────────
 PORT = int(os.getenv("STT_PORT", "0"))  # 0 = auto
 API_KEY = os.getenv("STT_API_KEY", "dev-key-123")
-MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip"
 MODEL_DIR = Path(__file__).parent / "models"
-MODEL_PATH = MODEL_DIR / "vosk-model-ru-0.42"
+
+MODELS = {
+    "small": {
+        "name": "vosk-model-small-ru-0.22",
+        "url": "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+        "size": "40 MB",
+    },
+    "big": {
+        "name": "vosk-model-ru-0.42",
+        "url": "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
+        "size": "1.8 GB",
+    },
+}
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
 logger = logging.getLogger("stt-sidecar")
+console = Console()
 
 # ── shared state ────────────────────────────────────────────────────
 class State:
@@ -36,6 +50,7 @@ class State:
     last_text = ""
     total_chars = 0
     model_ready = False
+    model_name = ""
     actual_port = 8081
     error = ""
 
@@ -47,7 +62,7 @@ def find_free_port(start=8081, end=8086):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             if s.connect_ex(('127.0.0.1', port)) != 0:
                 return port
-    return start  # если все заняты — пусть uvicorn упадёт
+    return start
 
 # ── model download ──────────────────────────────────────────────────
 def _progress(blocknr, blocksize, totalsize):
@@ -59,41 +74,64 @@ def _progress(blocknr, blocksize, totalsize):
         mb_total = totalsize / 1024 / 1024
         print(f"\r  [{bar}] {pct:.0f}% ({mb_dl:.0f}/{mb_total:.0f} MB)", end="", flush=True)
 
-def download_model():
-    if MODEL_PATH.exists():
-        state.model_ready = True
-        return
-    zip_path = MODEL_DIR / "vosk-model-ru-0.42.zip"
+def ensure_model():
+    # Проверяем, есть ли уже одна из моделей
+    for key, cfg in MODELS.items():
+        p = MODEL_DIR / cfg["name"]
+        if p.exists():
+            state.model_ready = True
+            state.model_name = cfg["name"]
+            return key, cfg
+
+    # Нет модели — спрашиваем (до TUI, обычный input)
+    console.print()
+    console.print("[bold cyan]🎤 STT Sidecar[/bold cyan] — выберите модель:", style="bold")
+    console.print("  [1] small  (vosk-model-small-ru-0.22, 40 MB) — [green]быстрая загрузка[/green]")
+    console.print("  [2] big    (vosk-model-ru-0.42, 1.8 GB) — точнее, но долго качать")
+    console.print()
+    choice = console.input("[bold]Ваш выбор [1/2]: [/bold]").strip()
+    key = "big" if choice == "2" else "small"
+    cfg = MODELS[key]
+
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print(f"\n  ⬇ Скачиваю модель VOSK (big, ~1.8GB)...\n")
+    zip_path = MODEL_DIR / f"{cfg['name']}.zip"
+    model_path = MODEL_DIR / cfg["name"]
+
+    console.print(f"\n  ⬇ Скачиваю {cfg['name']} ({cfg['size']})...\n")
     try:
-        urlretrieve(MODEL_URL, str(zip_path), _progress)
-        print(f"\n  📦 Распаковываю...")
+        urlretrieve(cfg["url"], str(zip_path), _progress)
+        console.print(f"\n  📦 Распаковываю...")
         shutil.unpack_archive(str(zip_path), str(MODEL_DIR))
         zip_path.unlink()
-        print(f"  ✅ Модель готова: {MODEL_PATH}\n")
-        state.model_ready = True
+        console.print(f"  ✅ Модель готова: {model_path}\n")
     except Exception as e:
-        state.error = f"Ошибка загрузки модели: {e}"
-        print(f"\n  ❌ {state.error}\n")
+        console.print(f"  ❌ Ошибка: {e}")
+        sys.exit(1)
+
+    state.model_ready = True
+    state.model_name = cfg["name"]
+    return key, cfg
 
 # ── VOSK engine (lazy load) ─────────────────────────────────────────
 def get_recognizer():
     from vosk import Model, KaldiRecognizer
     if not hasattr(get_recognizer, "_model"):
-        get_recognizer._model = Model(str(MODEL_PATH))
+        model_path = MODEL_DIR / state.model_name
+        get_recognizer._model = Model(str(model_path))
     return KaldiRecognizer(get_recognizer._model, 16000)
 
 # ── FastAPI ─────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(_app):
-    async def _dl():
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, download_model)
-    asyncio.create_task(_dl())
     yield
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def health():
@@ -142,7 +180,7 @@ def render():
     t.add_column("Параметр", style="bold")
     t.add_column("Значение")
     t.add_row("WebSocket", url)
-    t.add_row("Модель", "✅ загружена" if state.model_ready else "⏳ загрузка...")
+    t.add_row("Модель", f"✅ {state.model_name}" if state.model_ready else "⏳ загрузка...")
     t.add_row("Подключения", str(state.connections))
     t.add_row("Распознано символов", str(state.total_chars))
     t.add_row("Последний текст", state.last_text[:80] if state.last_text else "—")
@@ -179,6 +217,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        ensure_model()  # спрашивает и качает ДО TUI
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         print("\n👋 До свидания!")
