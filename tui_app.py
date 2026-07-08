@@ -56,6 +56,9 @@ class State:
     error = ""
     search_engine: object | None = None
     last_reindex_task_count = 0
+    ollama_available = False
+    embed_model = "nomic-embed-text"
+    vec_db_initialized = False
 
 state = State()
 
@@ -131,8 +134,29 @@ app = FastAPI()
 try:
     from stt_sidecar.search_engine import SearchEngine
     state.search_engine = SearchEngine(str(Path(__file__).parent / "search.db"))
+    state.vec_db_initialized = True
 except Exception:
     pass
+
+# ── check ollama availability ────────────────────────────────────────
+def check_ollama():
+    """Check if Ollama is running and nomic-embed-text is available."""
+    try:
+        from urllib.request import Request, urlopen
+        req = Request("http://localhost:11434/api/tags", method="GET")
+        with urlopen(req, timeout=2) as resp:
+            data = json.loads(resp.read())
+            models = [m["name"] for m in data.get("models", [])]
+            if any("nomic-embed" in m for m in models):
+                state.ollama_available = True
+                for m in models:
+                    if "nomic-embed" in m:
+                        state.embed_model = m
+                        break
+    except Exception:
+        state.ollama_available = False
+
+check_ollama()
 
 
 class ReindexRequest(BaseModel):
@@ -151,6 +175,9 @@ async def health():
         "connections": state.connections,
         "port": state.actual_port,
         "search_engine_ready": state.search_engine is not None,
+        "ollama_available": state.ollama_available,
+        "embed_model": state.embed_model,
+        "vec_db_initialized": state.vec_db_initialized,
     }
 
 @app.websocket("/ws/transcribe")
@@ -251,8 +278,37 @@ def render():
     if state.error:
         t.add_row("Ошибка", Text(state.error, style="red"))
     body = Panel(t, title="📊 Статус", box=box.ROUNDED)
+
+    # Vectorization tools panel
+    vt = Table(box=box.SIMPLE)
+    vt.add_column("Инструмент", style="bold")
+    vt.add_column("Статус")
+    vt.add_row(
+        "Ollama",
+        f"✅ {state.embed_model}" if state.ollama_available
+        else "❌ не запущен"
+    )
+    vt.add_row(
+        "sqlite-vec",
+        "✅ инициализирована" if state.vec_db_initialized
+        else "❌ ошибка"
+    )
+    vt.add_row(
+        "Поисковый движок",
+        "✅ готов" if state.search_engine is not None else "❌ не инициализирован",
+    )
+    vt.add_row(
+        "База данных",
+        f"✅ {Path(__file__).parent / 'search.db'}" if (Path(__file__).parent / "search.db").exists()
+        else "⏳ будет создана при первой индексации",
+    )
+    tools_body = Panel(vt, title="🔧 Векторизация", box=box.ROUNDED)
+
+    # Stack body: main status + tools
+    from rich import columns as rich_cols
+    body_row = rich_cols.Columns([body, tools_body], equal=True)
     ftr = Panel(Text(f"⬆ Открой tasks.webworx.ru → микрофон работает через {url}", style="dim"), box=box.ROUNDED)
-    return hdr, body, ftr
+    return hdr, body_row, ftr
 
 async def tui_loop():
     layout = make_layout()

@@ -19,6 +19,9 @@ def test_health_still_works():
     data = r.json()
     assert "status" in data
     assert data["search_engine_ready"] is True
+    assert "ollama_available" in data
+    assert "embed_model" in data
+    assert "vec_db_initialized" in data
 
 
 def test_search_endpoint_exists():
