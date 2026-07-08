@@ -203,8 +203,15 @@ async def reindex(body: ReindexRequest, authorization: str = Header(None)):
         raise HTTPException(401, "invalid api key")
     if state.search_engine is None:
         raise HTTPException(503, "search engine not initialized")
-    # ponytail: for now, index with empty task list — django_client.py not integrated yet
-    tasks = []
+    from stt_sidecar.django_client import fetch_project_tasks
+    try:
+        tasks = fetch_project_tasks("https://tasks.webworx.ru", body.project_id, API_KEY)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"django api error: {e}")
     count = state.search_engine.reindex_project(body.project_id, tasks)
     state.search_engine.build_graph(body.project_id, tasks)
     state.last_reindex_task_count = count

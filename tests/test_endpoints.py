@@ -1,11 +1,16 @@
 """TDD Red→Green: FastAPI endpoints — /search, /reindex, /graph."""
+import httpx
 import pytest
 from fastapi.testclient import TestClient
+from unittest.mock import patch
 
 from tui_app import app, API_KEY
 
-# FastAPI TestClient runs lifespan automatically
 client = TestClient(app)
+
+# shared mock for django_client calls
+MOCK_EMPTY = httpx.Response(200, json={"count": 0, "next": None, "results": []})
+DC_PATH = "stt_sidecar.django_client.httpx.Client.get"
 
 
 def test_health_still_works():
@@ -39,23 +44,25 @@ def test_reindex_requires_auth():
 
 
 def test_reindex_with_valid_auth():
-    r = client.post(
-        "/reindex",
-        json={"project_id": 10},
-        headers={"Authorization": f"Bearer {API_KEY}"},
-    )
-    assert r.status_code == 200
+    with patch(DC_PATH, return_value=MOCK_EMPTY):
+        r = client.post(
+            "/reindex",
+            json={"project_id": 10},
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        assert r.status_code == 200
 
 
 def test_reindex_returns_task_count():
-    r = client.post(
-        "/reindex",
-        json={"project_id": 10},
-        headers={"Authorization": f"Bearer {API_KEY}"},
-    )
-    data = r.json()
-    assert "task_count" in data
-    assert isinstance(data["task_count"], int)
+    with patch(DC_PATH, return_value=MOCK_EMPTY):
+        r = client.post(
+            "/reindex",
+            json={"project_id": 10},
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
+        data = r.json()
+        assert "task_count" in data
+        assert isinstance(data["task_count"], int)
 
 
 def test_reindex_missing_project_id():
@@ -73,12 +80,12 @@ def test_graph_endpoint_exists():
 
 
 def test_graph_returns_nodes_and_edges():
-    # First reindex so there's data
-    client.post(
-        "/reindex",
-        json={"project_id": 10},
-        headers={"Authorization": f"Bearer {API_KEY}"},
-    )
+    with patch(DC_PATH, return_value=MOCK_EMPTY):
+        client.post(
+            "/reindex",
+            json={"project_id": 10},
+            headers={"Authorization": f"Bearer {API_KEY}"},
+        )
     r = client.get("/graph?project_id=10")
     data = r.json()
     assert "nodes" in data
