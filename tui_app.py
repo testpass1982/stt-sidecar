@@ -11,8 +11,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.request import urlretrieve
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, WebSocket, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
@@ -53,6 +54,8 @@ class State:
     model_name = ""
     actual_port = 8081
     error = ""
+    search_engine: object | None = None
+    last_reindex_task_count = 0
 
 state = State()
 
@@ -121,11 +124,19 @@ def get_recognizer():
     return KaldiRecognizer(get_recognizer._model, 16000)
 
 # ── FastAPI ─────────────────────────────────────────────────────────
-@asynccontextmanager
-async def lifespan(_app):
-    yield
+app = FastAPI()
 
-app = FastAPI(lifespan=lifespan)
+# ponytail: engine initialized eagerly at module level, not in lifespan.
+# Works with TestClient which doesn't call lifespan protocol.
+try:
+    from stt_sidecar.search_engine import SearchEngine
+    state.search_engine = SearchEngine(str(Path(__file__).parent / "search.db"))
+except Exception:
+    pass
+
+
+class ReindexRequest(BaseModel):
+    project_id: int
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -135,7 +146,12 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok" if state.model_ready else "loading", "connections": state.connections, "port": state.actual_port}
+    return {
+        "status": "ok" if state.model_ready else "loading",
+        "connections": state.connections,
+        "port": state.actual_port,
+        "search_engine_ready": state.search_engine is not None,
+    }
 
 @app.websocket("/ws/transcribe")
 async def transcribe(ws: WebSocket):
@@ -167,6 +183,41 @@ async def transcribe(ws: WebSocket):
         state.connections -= 1
         logger.info("client disconnected (%d active)", state.connections)
 
+# ── Close engine on process exit ────────────────────────────────────────
+import atexit
+
+atexit.register(lambda: state.search_engine.close() if state.search_engine else None)
+
+# ── Search endpoints ──────────────────────────────────────────────────
+@app.get("/search")
+async def search(q: str, project_id: int, top_k: int = 20):
+    if state.search_engine is None:
+        raise HTTPException(503, "search engine not initialized")
+    results = state.search_engine.semantic_search(q, project_id, top_k)
+    return {"results": results, "query": q, "project_id": project_id}
+
+
+@app.post("/reindex")
+async def reindex(body: ReindexRequest, authorization: str = Header(None)):
+    if authorization != f"Bearer {API_KEY}":
+        raise HTTPException(401, "invalid api key")
+    if state.search_engine is None:
+        raise HTTPException(503, "search engine not initialized")
+    # ponytail: for now, index with empty task list — django_client.py not integrated yet
+    tasks = []
+    count = state.search_engine.reindex_project(body.project_id, tasks)
+    state.search_engine.build_graph(body.project_id, tasks)
+    state.last_reindex_task_count = count
+    return {"status": "ok", "task_count": count, "project_id": body.project_id}
+
+
+@app.get("/graph")
+async def graph(project_id: int):
+    if state.search_engine is None:
+        raise HTTPException(503, "search engine not initialized")
+    return state.search_engine.get_graph(project_id)
+
+
 # ── Rich TUI ────────────────────────────────────────────────────────
 def make_layout():
     layout = Layout()
@@ -184,6 +235,12 @@ def render():
     t.add_row("Подключения", str(state.connections))
     t.add_row("Распознано символов", str(state.total_chars))
     t.add_row("Последний текст", state.last_text[:80] if state.last_text else "—")
+    t.add_row(
+        "Индекс проекта",
+        f"✅ {state.last_reindex_task_count} задач"
+        if state.last_reindex_task_count
+        else "⏳ не индексирован",
+    )
     if state.error:
         t.add_row("Ошибка", Text(state.error, style="red"))
     body = Panel(t, title="📊 Статус", box=box.ROUNDED)

@@ -10,3 +10,5 @@ dist/
 build/
 .DS_Store
 *.log
+search.db
+.pytest_cache/
